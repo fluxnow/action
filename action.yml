@@ -1,0 +1,503 @@
+name: 'FluxNow Deploy'
+description: 'Build, push, and deploy your app to FluxNow — or promote staging to production'
+author: 'FluxNow <admin@fluxnow.dev>'
+
+branding:
+  icon: 'zap'
+  color: 'purple'
+
+inputs:
+  fluxnow-token:
+    description: 'FluxNow authentication token (FLUXNOW_TOKEN secret)'
+    required: true
+  mode:
+    description: 'build-and-deploy (default) or promote (promote staging tag to target env)'
+    required: false
+    default: 'build-and-deploy'
+  target-env:
+    description: 'Target environment for promote mode (e.g. prod). Updates deploy/values-{target-env}.yaml'
+    required: false
+    default: 'prod'
+  build-strategy:
+    description: 'Build strategy: auto (default), dockerfile, or railpack'
+    required: false
+    default: 'auto'
+  dockerfile:
+    description: 'Path to Dockerfile (when build-strategy is dockerfile)'
+    required: false
+    default: 'Dockerfile'
+  context:
+    description: 'Build context directory'
+    required: false
+    default: '.'
+  values-path:
+    description: 'Path to the staging values file. Default: deploy/values.yaml. For monorepos: deploy/{service}/values.yaml. Prod file is derived as {dir}/values-{target-env}.yaml'
+    required: false
+    default: 'deploy/values.yaml'
+  sibling-values:
+    description: 'Comma-separated paths to sibling service values files (monorepo only). When set, the action retags each sibling''s staging image with the PR tag so preview environments work end-to-end even when only one service changed. Example: deploy/uca-backend/values.yaml'
+    required: false
+    default: ''
+  fluxnow-api-url:
+    description: 'FluxNow API base URL (override for self-hosted)'
+    required: false
+    default: 'https://onboarding.openfab.dev'
+
+outputs:
+  image-tag:
+    description: 'Image tag (built or promoted)'
+    value: ${{ steps.tags.outputs.short_sha || steps.promote.outputs.tag }}
+  image-uri:
+    description: 'Full image URI (build-and-deploy mode only)'
+    value: ${{ steps.tags.outputs.image_uri }}
+  deployment-url:
+    description: 'URL of the deployed environment'
+    value: ${{ steps.metadata.outputs.deployment_url || steps.promote.outputs.deployment_url }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ══════════════════════════════════════════════════════════════
+    # PROMOTE MODE — promote staging tag to target environment
+    # ══════════════════════════════════════════════════════════════
+    - name: Promote staging to ${{ inputs.target-env }}
+      id: promote
+      if: inputs.mode == 'promote'
+      shell: bash
+      run: |
+        set -euo pipefail
+        TARGET_ENV="${{ inputs.target-env }}"
+        STAGING_FILE="${{ inputs.values-path }}"
+        STAGING_DIR=$(dirname "${STAGING_FILE}")
+        PROD_FILE="${STAGING_DIR}/values-${TARGET_ENV}.yaml"
+
+        if [ ! -f "${STAGING_FILE}" ]; then
+          echo "::error title=Missing staging values::${STAGING_FILE} not found."
+          exit 1
+        fi
+        if [ ! -f "${PROD_FILE}" ]; then
+          echo "::error title=Missing ${TARGET_ENV} values::${PROD_FILE} not found. Has ${TARGET_ENV} been scaffolded?"
+          exit 1
+        fi
+
+        STAGING_TAG=$(grep -E '^\s+tag:' "${STAGING_FILE}" | head -1 | awk '{print $2}')
+        CURRENT_TAG=$(grep -E '^\s+tag:' "${PROD_FILE}" | head -1 | awk '{print $2}')
+        echo "📦 Staging: ${STAGING_TAG} → ${TARGET_ENV}: ${CURRENT_TAG}"
+
+        # Guard: reject if staging tag is "latest" (means no real build has happened)
+        if [ "${STAGING_TAG}" = "latest" ]; then
+          echo "::error title=No staging build::Staging tag is 'latest' — no image has been built yet. Push code to main first."
+          exit 1
+        fi
+
+        # Guard: reject if target still has the dormant "latest" marker AND
+        # there's no ArgoCD Application for prod (production not activated).
+        # Once activated, the first promote changes the tag from "latest" to
+        # a real sha, and this guard never fires again.
+        if [ "${CURRENT_TAG}" = "latest" ]; then
+          echo "::warning title=First production deployment::Target environment '${TARGET_ENV}' has never been deployed. Make sure production infrastructure is provisioned (DB, secrets, ArgoCD Application) before this image rolls out."
+        fi
+
+        if [ "${STAGING_TAG}" = "${CURRENT_TAG}" ]; then
+          echo "⏭️ Already on same tag. Nothing to promote."
+          echo "tag=${STAGING_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "skipped=true" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+
+        # Anchored sed: only match "  tag: <value>" lines (indented under image:)
+        sed -E -i "s|^([[:space:]]+tag:[[:space:]]+).*$|\1${STAGING_TAG}|" "${PROD_FILE}"
+        git config --global user.name "fluxnow[bot]"
+        git config --global user.email "bot@fluxnow.dev"
+        git add "${PROD_FILE}"
+        git commit -m "🚀 promote to ${TARGET_ENV}: ${STAGING_TAG}
+
+        Promoted by: ${{ github.actor }}
+        Previous ${TARGET_ENV} tag: ${CURRENT_TAG}"
+        for i in 1 2 3 4 5; do
+          if git push; then break; fi
+          echo "⚠️ Push failed (attempt $i/5), rebasing..."
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          sleep $((RANDOM % 3 + 1))
+        done
+
+        # Capture the new commit SHA for the deployment record
+        NEW_SHA=$(git rev-parse HEAD)
+
+        echo "tag=${STAGING_TAG}" >> "${GITHUB_OUTPUT}"
+        echo "previous_tag=${CURRENT_TAG}" >> "${GITHUB_OUTPUT}"
+        echo "new_sha=${NEW_SHA}" >> "${GITHUB_OUTPUT}"
+        echo "skipped=false" >> "${GITHUB_OUTPUT}"
+
+    - name: Resolve service name for promote
+      if: inputs.mode == 'promote' && steps.promote.outputs.skipped != 'true'
+      id: promote-service
+      shell: bash
+      run: |
+        set -euo pipefail
+        VALUES_PATH="${{ inputs.values-path }}"
+        SERVICE_NAME=""
+        if [ -f "${VALUES_PATH}" ] && [ "${VALUES_PATH}" != "deploy/values.yaml" ]; then
+          SERVICE_NAME=$(grep -E '^appName:' "${VALUES_PATH}" | head -1 | awk '{print $2}' | tr -d '"'"'"' ')
+        fi
+        echo "name=${SERVICE_NAME}" >> "${GITHUB_OUTPUT}"
+
+    - name: Create deployment record (promote)
+      if: inputs.mode == 'promote' && steps.promote.outputs.skipped != 'true'
+      uses: actions/github-script@v7
+      env:
+        SERVICE_NAME: ${{ steps.promote-service.outputs.name }}
+      with:
+        script: |
+          const targetEnv = '${{ inputs.target-env }}';
+          const serviceName = process.env.SERVICE_NAME || '';
+          // Per-service env name: "prod/uca-backend" for monorepos, "prod" for single-app
+          const envName = serviceName ? `${targetEnv}/${serviceName}` : targetEnv;
+          const tag = '${{ steps.promote.outputs.tag }}';
+          const newSha = '${{ steps.promote.outputs.new_sha }}' || context.sha;
+          const deployment = await github.rest.repos.createDeployment({
+            owner: context.repo.owner, repo: context.repo.repo,
+            ref: newSha, task: 'promote', auto_merge: false,
+            required_contexts: [], environment: envName,
+            description: `Promoted ${tag} from staging`,
+            transient_environment: false,
+            production_environment: targetEnv === 'prod' || targetEnv === 'production',
+            payload: { source: 'fluxnow-action', mode: 'promote', tag,
+              previous_tag: '${{ steps.promote.outputs.previous_tag }}',
+              promoted_by: '${{ github.actor }}', run_id: context.runId },
+          });
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner, repo: context.repo.repo,
+            deployment_id: deployment.data.id, state: 'success',
+            description: `Promoted ${tag} to ${targetEnv}`,
+            log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+          });
+
+    - name: Promotion summary
+      if: inputs.mode == 'promote' && steps.promote.outputs.skipped != 'true'
+      shell: bash
+      run: |
+        echo "## 🚀 Promoted to ${{ inputs.target-env }}" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| Property | Value |" >> "${GITHUB_STEP_SUMMARY}"
+        echo "|---|---|" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| **Promoted by** | @${{ github.actor }} |" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| **Image tag** | \`${{ steps.promote.outputs.tag }}\` |" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| **Previous tag** | \`${{ steps.promote.outputs.previous_tag }}\` |" >> "${GITHUB_STEP_SUMMARY}"
+
+    # ══════════════════════════════════════════════════════════════
+    # BUILD-AND-DEPLOY MODE (existing behavior)
+    # ══════════════════════════════════════════════════════════════
+
+    - name: Preflight
+      if: inputs.mode == 'build-and-deploy'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${{ inputs.fluxnow-token }}" ]; then
+          echo "::error title=Missing fluxnow-token::Pass your FLUXNOW_TOKEN secret as the fluxnow-token input."
+          exit 1
+        fi
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error title=Missing jq::jq is required but was not found on this runner."
+          exit 1
+        fi
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          HEAD_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          BASE_REPO="${{ github.repository }}"
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "::error title=Fork detected::FluxNow action skips builds from forked repositories to protect secrets."
+            exit 1
+          fi
+        fi
+
+    - name: Exchange token for registry credentials
+      if: inputs.mode == 'build-and-deploy'
+      id: exchange
+      shell: bash
+      env:
+        FLUXNOW_TOKEN: ${{ inputs.fluxnow-token }}
+        FLUXNOW_API_BASE_URL: ${{ inputs.fluxnow-api-url }}
+        REPO_OWNER: ${{ github.repository_owner }}
+        REPO_NAME: ${{ github.event.repository.name }}
+      run: |
+        set -euo pipefail
+        RESPONSE=$(curl -fsSL -X POST "${FLUXNOW_API_BASE_URL}/api/ci/registry-auth/exchange" \
+          -H "Authorization: Bearer ${FLUXNOW_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data "{\"owner\":\"${REPO_OWNER}\",\"repo\":\"${REPO_NAME}\"}")
+        REGISTRY_HOST=$(echo "${RESPONSE}" | jq -r '.registry_host')
+        REGISTRY_PROJECT=$(echo "${RESPONSE}" | jq -r '.registry_project')
+        IMAGE_REPOSITORY=$(echo "${RESPONSE}" | jq -r '.image_repository')
+        REGISTRY_USERNAME=$(echo "${RESPONSE}" | jq -r '.registry_username')
+        REGISTRY_PASSWORD=$(echo "${RESPONSE}" | jq -r '.registry_password')
+        if [ -z "${REGISTRY_HOST}" ] || [ "${REGISTRY_HOST}" = "null" ] || \
+           [ -z "${REGISTRY_PROJECT}" ] || [ "${REGISTRY_PROJECT}" = "null" ] || \
+           [ -z "${IMAGE_REPOSITORY}" ] || [ "${IMAGE_REPOSITORY}" = "null" ] || \
+           [ -z "${REGISTRY_USERNAME}" ] || [ "${REGISTRY_USERNAME}" = "null" ] || \
+           [ -z "${REGISTRY_PASSWORD}" ] || [ "${REGISTRY_PASSWORD}" = "null" ]; then
+          echo "::error title=Credential exchange failed::FluxNow API returned incomplete registry metadata."
+          exit 1
+        fi
+        echo "::add-mask::${REGISTRY_PASSWORD}"
+        # Monorepo: if values-path has image.repository, use it instead of API default
+        VALUES_PATH="${{ inputs.values-path }}"
+        if [ -f "${VALUES_PATH}" ]; then
+          REPO_OVERRIDE=$(grep -E '^\s+repository:' "${VALUES_PATH}" 2>/dev/null | head -1 | sed 's/.*repository:\s*//' | tr -d ' "'"'"'' || true)
+          if [ -n "${REPO_OVERRIDE}" ] && [ "${REPO_OVERRIDE}" != "${IMAGE_REPOSITORY}" ]; then
+            echo "::notice::Monorepo: overriding image repository ${IMAGE_REPOSITORY} → ${REPO_OVERRIDE} (from ${VALUES_PATH})"
+            IMAGE_REPOSITORY="${REPO_OVERRIDE}"
+          fi
+        fi
+        IMAGE_URI="${REGISTRY_HOST}/${REGISTRY_PROJECT}/${IMAGE_REPOSITORY}"
+        {
+          echo "registry_host=${REGISTRY_HOST}"
+          echo "registry_username=${REGISTRY_USERNAME}"
+          echo "registry_password=${REGISTRY_PASSWORD}"
+          echo "image_uri=${IMAGE_URI}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Log in to container registry
+      if: inputs.mode == 'build-and-deploy'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ steps.exchange.outputs.registry_host }}
+        username: ${{ steps.exchange.outputs.registry_username }}
+        password: ${{ steps.exchange.outputs.registry_password }}
+
+    - name: Generate image tags
+      if: inputs.mode == 'build-and-deploy'
+      id: tags
+      shell: bash
+      env:
+        IMAGE_URI: ${{ steps.exchange.outputs.image_uri }}
+      run: |
+        set -euo pipefail
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          COMMIT_SHA="${{ github.event.pull_request.head.sha }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          SHORT_SHA="${COMMIT_SHA::7}"
+          TAGS="${IMAGE_URI}:pr-${PR_NUMBER}-sha-${SHORT_SHA}"
+          TAGS="${TAGS}"$'\n'"${IMAGE_URI}:pr-${PR_NUMBER}"
+          TAGS="${TAGS}"$'\n'"${IMAGE_URI}:cache"
+        else
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAGS="${IMAGE_URI}:sha-${SHORT_SHA}"
+          TAGS="${TAGS}"$'\n'"${IMAGE_URI}:latest"
+          TAGS="${TAGS}"$'\n'"${IMAGE_URI}:cache"
+        fi
+        {
+          echo "short_sha=${SHORT_SHA}"
+          echo "tags<<EOF"
+          echo "${TAGS}"
+          echo "EOF"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Resolve build strategy
+      if: inputs.mode == 'build-and-deploy'
+      id: build-strategy
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.build-strategy }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+      run: |
+        set -euo pipefail
+        SELECTED="${REQUESTED}"
+        if [ "${SELECTED}" = "auto" ]; then
+          if [ -f "${DOCKERFILE}" ]; then SELECTED="dockerfile"; else SELECTED="railpack"; fi
+        fi
+        if [ "${SELECTED}" = "dockerfile" ] && [ ! -f "${DOCKERFILE}" ]; then
+          echo "::error title=Missing Dockerfile::${DOCKERFILE} not found."
+          exit 1
+        fi
+        echo "strategy=${SELECTED}" >> "${GITHUB_OUTPUT}"
+
+    - name: Set up Docker Buildx
+      if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'dockerfile'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push (Dockerfile)
+      if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'dockerfile'
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        push: true
+        tags: ${{ steps.tags.outputs.tags }}
+        cache-from: type=registry,ref=${{ steps.exchange.outputs.image_uri }}:cache
+        cache-to: type=registry,ref=${{ steps.exchange.outputs.image_uri }}:cache,mode=max
+
+    - name: Build and push (Railpack)
+      if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack'
+      uses: iloveitaly/github-action-railpack@b514b8b3584929020dd88ac0a6a20bd91eec68a5
+      with:
+        context: ${{ inputs.context }}
+        push: true
+        cache: true
+        cache_tag: ${{ steps.exchange.outputs.image_uri }}:cache
+        tags: ${{ steps.tags.outputs.tags }}
+
+    - name: Retag sibling staging images for preview
+      if: inputs.mode == 'build-and-deploy' && github.event_name == 'pull_request' && inputs.sibling-values != ''
+      shell: bash
+      env:
+        REGISTRY_HOST: ${{ steps.exchange.outputs.registry_host }}
+        REGISTRY_USERNAME: ${{ steps.exchange.outputs.registry_username }}
+        REGISTRY_PASSWORD: ${{ steps.exchange.outputs.registry_password }}
+        SIBLING_VALUES: ${{ inputs.sibling-values }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+
+        # Install crane for image retagging
+        CRANE_VERSION="0.20.2"
+        curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" | tar -xz -C /usr/local/bin crane
+        crane auth login "${REGISTRY_HOST}" -u "${REGISTRY_USERNAME}" -p "${REGISTRY_PASSWORD}"
+
+        SHORT_SHA="${COMMIT_SHA::7}"
+        IFS=',' read -ra SIBLINGS <<< "${SIBLING_VALUES}"
+
+        for VALUES_FILE in "${SIBLINGS[@]}"; do
+          VALUES_FILE=$(echo "${VALUES_FILE}" | tr -d ' ')
+          if [ ! -f "${VALUES_FILE}" ]; then
+            echo "::warning::Sibling values file not found: ${VALUES_FILE}"
+            continue
+          fi
+
+          # Read sibling's image repository and staging tag
+          SIBLING_REPO=$(grep -E '^\s+repository:' "${VALUES_FILE}" 2>/dev/null | head -1 | sed 's/.*repository:\s*//' | tr -d ' "'"'"'' || true)
+          SIBLING_TAG=$(grep -E '^\s+tag:' "${VALUES_FILE}" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"'"'"' ' || true)
+
+          if [ -z "${SIBLING_TAG}" ]; then
+            echo "::warning::No image tag found in ${VALUES_FILE}, skipping"
+            continue
+          fi
+
+          # Resolve full image URI — use registry project from exchange
+          REGISTRY_PROJECT=$(echo "${{ steps.exchange.outputs.image_uri }}" | sed "s|${REGISTRY_HOST}/||" | cut -d/ -f1)
+          if [ -n "${SIBLING_REPO}" ]; then
+            SIBLING_URI="${REGISTRY_HOST}/${REGISTRY_PROJECT}/${SIBLING_REPO}"
+          else
+            # Single-repo fallback: use repo name
+            SIBLING_URI="${REGISTRY_HOST}/${REGISTRY_PROJECT}/${{ github.event.repository.name }}"
+          fi
+
+          SOURCE="${SIBLING_URI}:${SIBLING_TAG}"
+          PR_TAG="pr-${PR_NUMBER}-sha-${SHORT_SHA}"
+          PR_LATEST="pr-${PR_NUMBER}"
+
+          echo "🔄 Retagging sibling: ${SOURCE} → ${PR_TAG}, ${PR_LATEST}"
+          crane tag "${SOURCE}" "${PR_TAG}" || echo "::warning::Failed to retag ${SOURCE} as ${PR_TAG}"
+          crane tag "${SOURCE}" "${PR_LATEST}" || echo "::warning::Failed to retag ${SOURCE} as ${PR_LATEST}"
+          echo "✅ Sibling ${VALUES_FILE} retagged"
+        done
+
+    - name: Resolve service name from values
+      if: inputs.mode == 'build-and-deploy'
+      id: service
+      shell: bash
+      run: |
+        set -euo pipefail
+        VALUES_PATH="${{ inputs.values-path }}"
+        SERVICE_NAME=""
+        if [ -f "${VALUES_PATH}" ] && [ "${VALUES_PATH}" != "deploy/values.yaml" ]; then
+          SERVICE_NAME=$(grep -E '^appName:' "${VALUES_PATH}" | head -1 | awk '{print $2}' | tr -d '"'"'"' ')
+        fi
+        echo "name=${SERVICE_NAME}" >> "${GITHUB_OUTPUT}"
+
+    - name: Create deployment metadata
+      if: inputs.mode == 'build-and-deploy'
+      id: metadata
+      uses: actions/github-script@v7
+      env:
+        IMAGE_URI: ${{ steps.exchange.outputs.image_uri }}
+        SHORT_SHA: ${{ steps.tags.outputs.short_sha }}
+        SERVICE_NAME: ${{ steps.service.outputs.name }}
+      with:
+        script: |
+          const isPR = context.eventName === 'pull_request';
+          const prNumber = context.payload.pull_request?.number;
+          const sha = isPR ? context.payload.pull_request.head.sha : context.sha;
+          const repoOwner = context.repo.owner;
+          const repoName = context.repo.repo;
+          const serviceName = process.env.SERVICE_NAME || '';
+          // Per-service env names for monorepos: staging/uca-backend, preview-pr-88/uca-backend
+          // Single-app repos: staging, preview-pr-88 (unchanged)
+          const envName = isPR
+            ? serviceName ? `preview-pr-${prNumber}/${serviceName}` : `preview-pr-${prNumber}`
+            : serviceName ? `staging/${serviceName}` : 'staging';
+          const baseHost = serviceName
+            ? `${repoOwner}-${serviceName}`
+            : `${repoOwner}-${repoName}`;
+          const deployUrl = isPR
+            ? `https://${baseHost}-pr-${prNumber}.openfab.dev`
+            : `https://${baseHost}.openfab.dev`;
+          const deployment = await github.rest.repos.createDeployment({
+            owner: repoOwner, repo: repoName, ref: sha,
+            task: 'build', auto_merge: false, required_contexts: [],
+            environment: envName,
+            description: 'Image built by FluxNow Action',
+            transient_environment: isPR, production_environment: false,
+            payload: { source: 'fluxnow-action',
+              ...(isPR ? { pr_number: prNumber } : {}), run_id: context.runId },
+          });
+          await github.rest.repos.createDeploymentStatus({
+            owner: repoOwner, repo: repoName,
+            deployment_id: deployment.data.id, state: 'success',
+            description: 'Image built and pushed', environment_url: deployUrl,
+            log_url: `${context.serverUrl}/${repoOwner}/${repoName}/actions/runs/${context.runId}`,
+          });
+          core.setOutput('deployment_url', deployUrl);
+
+    - name: Add preview label
+      if: inputs.mode == 'build-and-deploy' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.issues.addLabels({
+            owner: context.repo.owner, repo: context.repo.repo,
+            issue_number: context.payload.pull_request.number,
+            labels: ['preview'],
+          });
+
+    - name: Update deployment manifests
+      if: inputs.mode == 'build-and-deploy' && github.event_name == 'push'
+      shell: bash
+      env:
+        IMAGE_URI: ${{ steps.exchange.outputs.image_uri }}
+      run: |
+        set -euo pipefail
+        TAG="sha-${GITHUB_SHA::7}"
+        TARGET_IMAGE="${IMAGE_URI}:${TAG}"
+        VALUES_PATH="${{ inputs.values-path }}"
+        MANIFEST=""
+        if [ -f "${VALUES_PATH}" ]; then
+          # Helm values format (v1.1+) — supports monorepo via values-path input
+          MANIFEST="${VALUES_PATH}"
+          sed -E -i "s|(^[[:space:]]*tag:[[:space:]]*).*$|\1${TAG}|" "${VALUES_PATH}"
+        elif [ -f deploy/k8s/app.yaml ]; then
+          # Legacy K8s manifest format (v1)
+          MANIFEST="deploy/k8s/app.yaml"
+          sed -E -i "s|(^[[:space:]]*image:[[:space:]]*).*$|\1${TARGET_IMAGE}|" deploy/k8s/app.yaml
+        else
+          echo "::notice title=No manifests::No ${VALUES_PATH} or deploy/k8s/app.yaml found."
+          exit 0
+        fi
+        git config --global user.name "fluxnow[bot]"
+        git config --global user.email "bot@fluxnow.dev"
+        if ! git diff --quiet "${MANIFEST}"; then
+          git add "${MANIFEST}"
+          git commit -m "🚀 deploy: update image to ${TAG} [skip ci]"
+          # Retry push with rebase (handles concurrent pushes in monorepos)
+          for i in 1 2 3 4 5; do
+            if git push; then
+              echo "✅ Manifest updated (${MANIFEST})"
+              break
+            fi
+            echo "⚠️ Push failed (attempt $i/5), rebasing..."
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            sleep $((RANDOM % 3 + 1))
+          done
+        else
+          echo "⏭️ No manifest changes"
+        fi
