@@ -144,6 +144,25 @@ In a monorepo, a frontend-only PR triggers only the frontend workflow. The backe
 
 With `sibling-values`, the action retags each sibling's current staging image with the PR-specific tag using [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane). The ArgoCD ApplicationSet finds images for all services and the preview works end-to-end.
 
+**Note:** Resource provisioning (databases, Telegram bots, secrets) is handled independently by the FluxNow onboarding service. When a PR is opened, the `pull_request` webhook triggers provisioning for **all** services defined in `fluxnow.yaml` — regardless of which files changed. `sibling-values` only solves the container image availability problem.
+
+## How it works
+
+1. Exchanges `FLUXNOW_TOKEN` for short-lived registry credentials
+2. Auto-detects build strategy (Dockerfile or Railpack)
+3. Builds and pushes image to Harbor registry
+4. Retags sibling staging images for preview (if `sibling-values` set)
+5. Creates GitHub Deployment with environment URL
+6. On push to main: updates `values.yaml` with new image tag (with retry for concurrent monorepo pushes)
+7. On PR: adds `preview` label — ArgoCD syncs the preview environment
+
+## Security
+
+- Fork PRs are automatically skipped
+- Registry credentials are short-lived (per-run exchange)
+- Passwords masked in workflow logs
+- No registry credentials stored in customer repos
+
 ## License
 
 MIT
