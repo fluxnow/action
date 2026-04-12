@@ -278,12 +278,10 @@ runs:
           SHORT_SHA="${COMMIT_SHA::7}"
           TAGS="${IMAGE_URI}:pr-${PR_NUMBER}-sha-${SHORT_SHA}"
           TAGS="${TAGS}"$'\n'"${IMAGE_URI}:pr-${PR_NUMBER}"
-          TAGS="${TAGS}"$'\n'"${IMAGE_URI}:cache"
         else
           SHORT_SHA="${GITHUB_SHA::7}"
           TAGS="${IMAGE_URI}:sha-${SHORT_SHA}"
           TAGS="${TAGS}"$'\n'"${IMAGE_URI}:latest"
-          TAGS="${TAGS}"$'\n'"${IMAGE_URI}:cache"
         fi
         {
           echo "short_sha=${SHORT_SHA}"
@@ -323,8 +321,8 @@ runs:
         file: ${{ inputs.dockerfile }}
         push: true
         tags: ${{ steps.tags.outputs.tags }}
-        cache-from: type=registry,ref=${{ steps.exchange.outputs.image_uri }}:cache
-        cache-to: type=registry,ref=${{ steps.exchange.outputs.image_uri }}:cache,mode=max
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
 
     - name: Build and push (Railpack)
       if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack'
@@ -332,8 +330,6 @@ runs:
       with:
         context: ${{ inputs.context }}
         push: true
-        cache: true
-        cache_tag: ${{ steps.exchange.outputs.image_uri }}:cache
         tags: ${{ steps.tags.outputs.tags }}
 
     - name: Retag sibling staging images for preview
