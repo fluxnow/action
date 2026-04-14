@@ -4,7 +4,7 @@
 
 If you opened a PR in this repo, you are responsible for driving it to green + approved. Do this loop automatically after every push:
 
-1. **Wait 90 seconds** after push for CI to start
+1. **Wait ~5 minutes** after push for CI to start
 2. **Check status**: `gh pr view <PR> --json statusCheckRollup,reviewDecision,isDraft` — repo is inferred from cwd
 3. **Check review comments**: `gh api repos/{owner}/{repo}/pulls/<PR>/comments` — `{owner}/{repo}` is the gh CLI template syntax that auto-resolves
 4. **If CI red OR unresolved bot comments**:
