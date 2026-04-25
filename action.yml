@@ -313,6 +313,14 @@ runs:
       if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'dockerfile'
       uses: docker/setup-buildx-action@v3
 
+    # INF-516: BuildKit cache lives on Harbor, not GHA. GHA cache is hosted by
+    # GitHub (US-East), arc-runner-fluxnow runs in Hetzner (EU) — pulling a
+    # 150MB+ deps layer was clocked at ~1MB/s and added 2-3 min per build.
+    # Harbor is in-cluster, so cache pull is gigabit local (~5-10s).
+    #
+    # Cache ref is keyed per-image (cache:${IMAGE_REPOSITORY}-buildcache) so
+    # dash + engine + customer-X don't stomp on each other's layers. The PAT
+    # used to push the image is reused for cache pull/push (same registry).
     - name: Build and push (Dockerfile)
       if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'dockerfile'
       uses: docker/build-push-action@v6
@@ -321,8 +329,8 @@ runs:
         file: ${{ inputs.dockerfile }}
         push: true
         tags: ${{ steps.tags.outputs.tags }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        cache-from: type=registry,ref=${{ steps.exchange.outputs.image_uri }}-buildcache
+        cache-to: type=registry,ref=${{ steps.exchange.outputs.image_uri }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true
 
     - name: Build and push (Railpack)
       if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack'
