@@ -41,7 +41,7 @@ inputs:
   fluxnow-api-url:
     description: 'FluxNow API base URL (override for self-hosted)'
     required: false
-    default: 'https://onboarding.openfab.dev'
+    default: 'https://engine.fluxnow.app'
 
 outputs:
   image-tag:
