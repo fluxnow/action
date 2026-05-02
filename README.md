@@ -129,7 +129,7 @@ jobs:
 | `context` | Docker build context directory. For monorepos, set to the service subdirectory (e.g. `./backend`). | `.` |
 | `values-path` | Path to the Helm staging values file. The action reads `image.repository` from this file (monorepo image routing) and writes the new `image.tag` after build. For monorepos: `deploy/{service}/values.yaml`. | `deploy/values.yaml` |
 | `sibling-values` | Comma-separated paths to sibling service values files. **Monorepo only.** When a PR only changes one service, the action retags each sibling's current staging image with the PR-specific tag using `crane`. This prevents `ImagePullBackOff` on unchanged services in preview. Example: `deploy/uca-backend/values.yaml`. | — |
-| `fluxnow-api-url` | FluxNow API base URL. Override for self-hosted FluxNow installations. | `https://onboarding.openfab.dev` |
+| `fluxnow-api-url` | FluxNow API base URL. Override for self-hosted FluxNow installations. | `https://engine.fluxnow.app` |
 
 ## Outputs
 
