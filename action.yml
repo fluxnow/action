@@ -354,12 +354,23 @@ runs:
         START_COMMAND: ${{ inputs.start-command }}
       run: |
         set -euo pipefail
+        # Use GITHUB_ENV heredoc syntax so a multiline command (YAML block scalar,
+        # `a && b` on separate lines) is preserved instead of truncated/broken by
+        # a plain `KEY=VALUE` line.
         if [ -n "${BUILD_COMMAND}" ]; then
-          echo "RAILPACK_BUILD_CMD=${BUILD_COMMAND}" >> "${GITHUB_ENV}"
+          {
+            echo "RAILPACK_BUILD_CMD<<__FLUXNOW_RAILPACK_EOF__"
+            echo "${BUILD_COMMAND}"
+            echo "__FLUXNOW_RAILPACK_EOF__"
+          } >> "${GITHUB_ENV}"
           echo "::notice title=Railpack build command::${BUILD_COMMAND}"
         fi
         if [ -n "${START_COMMAND}" ]; then
-          echo "RAILPACK_START_CMD=${START_COMMAND}" >> "${GITHUB_ENV}"
+          {
+            echo "RAILPACK_START_CMD<<__FLUXNOW_RAILPACK_EOF__"
+            echo "${START_COMMAND}"
+            echo "__FLUXNOW_RAILPACK_EOF__"
+          } >> "${GITHUB_ENV}"
           echo "::notice title=Railpack start command::${START_COMMAND}"
         fi
 
