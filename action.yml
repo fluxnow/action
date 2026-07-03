@@ -38,6 +38,10 @@ inputs:
     description: "Railpack start command override (sets RAILPACK_START_CMD). Monorepo: select one app, e.g. 'pnpm --filter @scope/app start'. Empty = Railpack auto-detect (default). Ignored for dockerfile builds."
     required: false
     default: ''
+  auto-deploy:
+    description: "When 'false', build + push the image but do NOT commit the tag to the values file (no auto rollout — customer deploys manually). Default 'true' preserves current behavior."
+    required: false
+    default: 'true'
   values-path:
     description: 'Path to the staging values file. Default: deploy/values.yaml. For monorepos: deploy/{service}/values.yaml. Prod file is derived as {dir}/values-{target-env}.yaml'
     required: false
@@ -507,7 +511,7 @@ runs:
           });
 
     - name: Update deployment manifests
-      if: inputs.mode == 'build-and-deploy' && github.event_name == 'push'
+      if: inputs.mode == 'build-and-deploy' && github.event_name == 'push' && inputs.auto-deploy != 'false'
       shell: bash
       env:
         IMAGE_URI: ${{ steps.exchange.outputs.image_uri }}
