@@ -30,6 +30,14 @@ inputs:
     description: 'Build context directory'
     required: false
     default: '.'
+  build-command:
+    description: "Railpack build command override (sets RAILPACK_BUILD_CMD). Monorepo: select one app, e.g. 'pnpm --filter @scope/app build'. Empty = Railpack auto-detect (default). Ignored for dockerfile builds."
+    required: false
+    default: ''
+  start-command:
+    description: "Railpack start command override (sets RAILPACK_START_CMD). Monorepo: select one app, e.g. 'pnpm --filter @scope/app start'. Empty = Railpack auto-detect (default). Ignored for dockerfile builds."
+    required: false
+    default: ''
   values-path:
     description: 'Path to the staging values file. Default: deploy/values.yaml. For monorepos: deploy/{service}/values.yaml. Prod file is derived as {dir}/values-{target-env}.yaml'
     required: false
@@ -331,6 +339,29 @@ runs:
         tags: ${{ steps.tags.outputs.tags }}
         cache-from: type=registry,ref=${{ steps.exchange.outputs.image_uri }}-buildcache
         cache-to: type=registry,ref=${{ steps.exchange.outputs.image_uri }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+
+    # Railpack reads RAILPACK_BUILD_CMD / RAILPACK_START_CMD from the process env of
+    # `railpack prepare`, which the composite Railpack action runs in entrypoint.sh.
+    # Export them here so they reach that process. Only NON-EMPTY values are written:
+    # an empty RAILPACK_START_CMD would otherwise override the start command to empty
+    # and break the container. This is how a monorepo app picks its build/start
+    # command without a Dockerfile (e.g. `pnpm --filter @scope/app build|start`).
+    - name: Prepare Railpack command overrides
+      if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack'
+      shell: bash
+      env:
+        BUILD_COMMAND: ${{ inputs.build-command }}
+        START_COMMAND: ${{ inputs.start-command }}
+      run: |
+        set -euo pipefail
+        if [ -n "${BUILD_COMMAND}" ]; then
+          echo "RAILPACK_BUILD_CMD=${BUILD_COMMAND}" >> "${GITHUB_ENV}"
+          echo "::notice title=Railpack build command::${BUILD_COMMAND}"
+        fi
+        if [ -n "${START_COMMAND}" ]; then
+          echo "RAILPACK_START_CMD=${START_COMMAND}" >> "${GITHUB_ENV}"
+          echo "::notice title=Railpack start command::${START_COMMAND}"
+        fi
 
     - name: Build and push (Railpack)
       if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack'
