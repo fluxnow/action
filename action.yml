@@ -30,6 +30,18 @@ inputs:
     description: 'Build context directory'
     required: false
     default: '.'
+  build-command:
+    description: "Railpack build command override, written to steps.build.commands in a generated railpack.json. Monorepo: select one app, e.g. 'pnpm --filter @scope/app build'. Empty = Railpack auto-detect. Ignored for dockerfile builds."
+    required: false
+    default: ''
+  start-command:
+    description: "Railpack start command override, written to deploy.startCommand in a generated railpack.json. Monorepo: select one app, e.g. 'pnpm --filter @scope/app start'. Empty = Railpack auto-detect. Ignored for dockerfile builds."
+    required: false
+    default: ''
+  auto-deploy:
+    description: "When 'false', build + push the image but do NOT commit the tag to the values file (no auto rollout — customer deploys manually). Default 'true' preserves current behavior."
+    required: false
+    default: 'true'
   values-path:
     description: 'Path to the staging values file. Default: deploy/values.yaml. For monorepos: deploy/{service}/values.yaml. Prod file is derived as {dir}/values-{target-env}.yaml'
     required: false
@@ -332,6 +344,37 @@ runs:
         cache-from: type=registry,ref=${{ steps.exchange.outputs.image_uri }}-buildcache
         cache-to: type=registry,ref=${{ steps.exchange.outputs.image_uri }}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true
 
+    # `railpack prepare` (run by the composite Railpack action) does NOT read
+    # RAILPACK_*_CMD env vars — verified empirically, it reports "No start command
+    # detected" and bakes a `bash -c bash` no-op. The build/start command must come
+    # from a railpack.json config file. Write one into the build context so a
+    # monorepo app can build via railpack with NO Dockerfile (e.g.
+    # `pnpm --filter @scope/app build|start`). Transient (CI only): the
+    # "Update deployment manifests" step commits the values file, never this.
+    - name: Write railpack.json from build/start command overrides
+      if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack' && (inputs.build-command != '' || inputs.start-command != '')
+      shell: bash
+      env:
+        BUILD_COMMAND: ${{ inputs.build-command }}
+        START_COMMAND: ${{ inputs.start-command }}
+        BUILD_CONTEXT: ${{ inputs.context }}
+      run: |
+        set -euo pipefail
+        TARGET="${BUILD_CONTEXT:-.}/railpack.json"
+        if [ -f "${TARGET}" ]; then
+          echo "::warning title=railpack.json overwritten::${TARGET} existed; replacing with FluxNow build/start commands."
+        fi
+        # jq builds valid JSON and safely escapes multiline / special chars in the
+        # commands. steps.build.commands = build; deploy.startCommand = start.
+        jq -n \
+          --arg build "${BUILD_COMMAND}" \
+          --arg start "${START_COMMAND}" \
+          '{ "$schema": "https://schema.railpack.com" }
+           + (if $build != "" then { steps: { build: { commands: [$build] } } } else {} end)
+           + (if $start != "" then { deploy: { startCommand: $start } } else {} end)' \
+          > "${TARGET}"
+        echo "--- ${TARGET} ---"; cat "${TARGET}"
+
     - name: Build and push (Railpack)
       if: inputs.mode == 'build-and-deploy' && steps.build-strategy.outputs.strategy == 'railpack'
       uses: iloveitaly/github-action-railpack@b514b8b3584929020dd88ac0a6a20bd91eec68a5
@@ -465,7 +508,7 @@ runs:
           });
 
     - name: Update deployment manifests
-      if: inputs.mode == 'build-and-deploy' && github.event_name == 'push'
+      if: inputs.mode == 'build-and-deploy' && github.event_name == 'push' && inputs.auto-deploy != 'false'
       shell: bash
       env:
         IMAGE_URI: ${{ steps.exchange.outputs.image_uri }}
