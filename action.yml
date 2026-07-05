@@ -215,7 +215,11 @@ runs:
         STAGING_TAG: ${{ steps.promote.outputs.tag }}
         VALUES_PATH: ${{ inputs.values-path }}
       run: |
-        # Intentionally NOT `set -e`: this step must never fail the promote.
+        # GitHub Actions runs `shell: bash` steps with `set -e -o pipefail` ENABLED
+        # by default, so an unguarded failure (e.g. a jq parse) would fail the
+        # promote. Disable both explicitly so this step is genuinely best-effort;
+        # each critical command is still guarded with `|| warn`.
+        set +e +o pipefail
         warn() { echo "::warning title=Retention tag skipped::$1 — promote still succeeded"; exit 0; }
 
         RESPONSE=$(curl -fsSL -X POST "${FLUXNOW_API_BASE_URL}/api/ci/registry-auth/exchange" \
@@ -226,9 +230,13 @@ runs:
         IMAGE_REPOSITORY=$(echo "${RESPONSE}" | jq -r '.image_repository')
         REGISTRY_USERNAME=$(echo "${RESPONSE}" | jq -r '.registry_username')
         REGISTRY_PASSWORD=$(echo "${RESPONSE}" | jq -r '.registry_password')
-        { [ -n "${REGISTRY_HOST}" ] && [ "${REGISTRY_HOST}" != "null" ] \
-          && [ -n "${REGISTRY_PASSWORD}" ] && [ "${REGISTRY_PASSWORD}" != "null" ]; } \
-          || warn "incomplete registry metadata"
+        { [ -n "${REGISTRY_HOST}" ]       && [ "${REGISTRY_HOST}" != "null" ] \
+          && [ -n "${REGISTRY_PROJECT}" ]    && [ "${REGISTRY_PROJECT}" != "null" ] \
+          && [ -n "${IMAGE_REPOSITORY}" ]    && [ "${IMAGE_REPOSITORY}" != "null" ] \
+          && [ -n "${REGISTRY_USERNAME}" ]   && [ "${REGISTRY_USERNAME}" != "null" ] \
+          && [ -n "${REGISTRY_PASSWORD}" ]   && [ "${REGISTRY_PASSWORD}" != "null" ] \
+          && [ -n "${TARGET_ENV}" ] && [ -n "${STAGING_TAG}" ]; } \
+          || warn "incomplete registry metadata or promote outputs"
         echo "::add-mask::${REGISTRY_PASSWORD}"
 
         # Monorepo: honour the image.repository override from the values file
