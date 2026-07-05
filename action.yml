@@ -507,44 +507,64 @@ runs:
             labels: ['preview'],
           });
 
+    # Commit the image-tag bump to the deploy manifest via the GitHub Contents
+    # API — NOT a local `git commit` + `git push`. API commits made with the
+    # Actions token are signed by GitHub (`verified`), so they satisfy a
+    # "require signed commits" ruleset. A local `git commit` is unsigned and is
+    # rejected (`GH013: Commits must have verified signatures`), which silently
+    # broke auto-deploy on repos with that rule. The API path keeps deploys
+    # automatic on push, with no ruleset bypass. Conflicts (concurrent monorepo
+    # deploys) are handled by re-reading the file SHA and retrying.
     - name: Update deployment manifests
       if: inputs.mode == 'build-and-deploy' && github.event_name == 'push' && inputs.auto-deploy != 'false'
-      shell: bash
+      uses: actions/github-script@v7
       env:
         IMAGE_URI: ${{ steps.exchange.outputs.image_uri }}
-      run: |
-        set -euo pipefail
-        TAG="sha-${GITHUB_SHA::7}"
-        TARGET_IMAGE="${IMAGE_URI}:${TAG}"
-        VALUES_PATH="${{ inputs.values-path }}"
-        MANIFEST=""
-        if [ -f "${VALUES_PATH}" ]; then
-          # Helm values format (v1.1+) — supports monorepo via values-path input
-          MANIFEST="${VALUES_PATH}"
-          sed -E -i "s|(^[[:space:]]*tag:[[:space:]]*).*$|\1${TAG}|" "${VALUES_PATH}"
-        elif [ -f deploy/k8s/app.yaml ]; then
-          # Legacy K8s manifest format (v1)
-          MANIFEST="deploy/k8s/app.yaml"
-          sed -E -i "s|(^[[:space:]]*image:[[:space:]]*).*$|\1${TARGET_IMAGE}|" deploy/k8s/app.yaml
-        else
-          echo "::notice title=No manifests::No ${VALUES_PATH} or deploy/k8s/app.yaml found."
-          exit 0
-        fi
-        git config --global user.name "fluxnow[bot]"
-        git config --global user.email "bot@fluxnow.dev"
-        if ! git diff --quiet "${MANIFEST}"; then
-          git add "${MANIFEST}"
-          git commit -m "🚀 deploy: update image to ${TAG} [skip ci]"
-          # Retry push with rebase (handles concurrent pushes in monorepos)
-          for i in 1 2 3 4 5; do
-            if git push; then
-              echo "✅ Manifest updated (${MANIFEST})"
-              break
-            fi
-            echo "⚠️ Push failed (attempt $i/5), rebasing..."
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            sleep $((RANDOM % 3 + 1))
-          done
-        else
-          echo "⏭️ No manifest changes"
-        fi
+        VALUES_PATH: ${{ inputs.values-path }}
+      with:
+        script: |
+          const fs = require('fs');
+          const tag = `sha-${context.sha.slice(0, 7)}`;
+          const targetImage = `${process.env.IMAGE_URI}:${tag}`;
+          const branch = context.ref.replace('refs/heads/', '');
+          const { owner, repo } = context.repo;
+          const valuesPath = process.env.VALUES_PATH;
+
+          // Compute the updated manifest content (Helm values, or legacy K8s).
+          let manifest, updated;
+          if (fs.existsSync(valuesPath)) {
+            manifest = valuesPath;
+            updated = fs.readFileSync(valuesPath, 'utf8')
+              .replace(/^(\s*tag:\s*).*$/gm, `$1${tag}`);
+          } else if (fs.existsSync('deploy/k8s/app.yaml')) {
+            manifest = 'deploy/k8s/app.yaml';
+            updated = fs.readFileSync(manifest, 'utf8')
+              .replace(/^(\s*image:\s*).*$/gm, `$1${targetImage}`);
+          } else {
+            core.notice(`No ${valuesPath} or deploy/k8s/app.yaml found.`);
+            return;
+          }
+          if (updated === fs.readFileSync(manifest, 'utf8')) {
+            core.info('⏭️ No manifest changes');
+            return;
+          }
+          const content = Buffer.from(updated, 'utf8').toString('base64');
+          const message = `🚀 deploy: update image to ${tag} [skip ci]`;
+
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            try {
+              const { data: cur } = await github.rest.repos.getContent({
+                owner, repo, path: manifest, ref: branch,
+              });
+              await github.rest.repos.createOrUpdateFileContents({
+                owner, repo, path: manifest, message, content, sha: cur.sha, branch,
+              });
+              core.info(`✅ Manifest updated (${manifest}) via verified API commit`);
+              return;
+            } catch (err) {
+              // 409 = the branch moved (concurrent deploy) — re-read SHA and retry.
+              core.warning(`API commit attempt ${attempt}/5 failed (${err.status || ''}): ${err.message}`);
+              await new Promise((r) => setTimeout(r, 1000 + Math.floor(Math.random() * 2000)));
+            }
+          }
+          core.setFailed(`Could not update ${manifest} after 5 attempts.`);
