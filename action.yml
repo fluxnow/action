@@ -196,6 +196,58 @@ runs:
         echo "| **Image tag** | \`${{ steps.promote.outputs.tag }}\` |" >> "${GITHUB_STEP_SUMMARY}"
         echo "| **Previous tag** | \`${{ steps.promote.outputs.previous_tag }}\` |" >> "${GITHUB_STEP_SUMMARY}"
 
+    # Protect the promoted image from Harbor tag-retention by tagging its digest
+    # with the target-env name (e.g. "prod"). Harbor keeps a whole artifact if ANY
+    # of its tags is retained, so this keeps the deployed sha alive even after
+    # `latest` moves on to newer builds — preventing an in-use prod image from
+    # being garbage-collected out from under a running deployment.
+    # BEST-EFFORT: this must never block a promote. Any failure → warning + exit 0;
+    # the deploy already happened in the steps above.
+    - name: Tag promoted image for retention protection (best-effort)
+      if: inputs.mode == 'promote' && steps.promote.outputs.skipped != 'true'
+      shell: bash
+      env:
+        FLUXNOW_TOKEN: ${{ inputs.fluxnow-token }}
+        FLUXNOW_API_BASE_URL: ${{ inputs.fluxnow-api-url }}
+        REPO_OWNER: ${{ github.repository_owner }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        TARGET_ENV: ${{ inputs.target-env }}
+        STAGING_TAG: ${{ steps.promote.outputs.tag }}
+        VALUES_PATH: ${{ inputs.values-path }}
+      run: |
+        # Intentionally NOT `set -e`: this step must never fail the promote.
+        warn() { echo "::warning title=Retention tag skipped::$1 — promote still succeeded"; exit 0; }
+
+        RESPONSE=$(curl -fsSL -X POST "${FLUXNOW_API_BASE_URL}/api/ci/registry-auth/exchange" \
+          -H "Authorization: Bearer ${FLUXNOW_TOKEN}" -H "Content-Type: application/json" \
+          --data "{\"owner\":\"${REPO_OWNER}\",\"repo\":\"${REPO_NAME}\"}") || warn "credential exchange failed"
+        REGISTRY_HOST=$(echo "${RESPONSE}" | jq -r '.registry_host')
+        REGISTRY_PROJECT=$(echo "${RESPONSE}" | jq -r '.registry_project')
+        IMAGE_REPOSITORY=$(echo "${RESPONSE}" | jq -r '.image_repository')
+        REGISTRY_USERNAME=$(echo "${RESPONSE}" | jq -r '.registry_username')
+        REGISTRY_PASSWORD=$(echo "${RESPONSE}" | jq -r '.registry_password')
+        { [ -n "${REGISTRY_HOST}" ] && [ "${REGISTRY_HOST}" != "null" ] \
+          && [ -n "${REGISTRY_PASSWORD}" ] && [ "${REGISTRY_PASSWORD}" != "null" ]; } \
+          || warn "incomplete registry metadata"
+        echo "::add-mask::${REGISTRY_PASSWORD}"
+
+        # Monorepo: honour the image.repository override from the values file
+        if [ -f "${VALUES_PATH}" ]; then
+          REPO_OVERRIDE=$(grep -E '^\s+repository:' "${VALUES_PATH}" 2>/dev/null | head -1 | sed 's/.*repository:\s*//' | tr -d ' "'"'"'' || true)
+          [ -n "${REPO_OVERRIDE}" ] && IMAGE_REPOSITORY="${REPO_OVERRIDE}"
+        fi
+        IMAGE_URI="${REGISTRY_HOST}/${REGISTRY_PROJECT}/${IMAGE_REPOSITORY}"
+
+        echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USERNAME}" --password-stdin \
+          || warn "registry login failed"
+
+        # Server-side retag (no pull): point ${TARGET_ENV} at the SAME digest as the
+        # promoted sha. Idempotent — re-running just re-points the tag.
+        docker buildx imagetools create --tag "${IMAGE_URI}:${TARGET_ENV}" "${IMAGE_URI}:${STAGING_TAG}" \
+          || warn "imagetools retag failed"
+
+        echo "🏷️  Tagged ${IMAGE_URI}:${TARGET_ENV} → digest of ${STAGING_TAG} (protected from retention)"
+
     # ══════════════════════════════════════════════════════════════
     # BUILD-AND-DEPLOY MODE (existing behavior)
     # ══════════════════════════════════════════════════════════════
