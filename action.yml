@@ -222,7 +222,7 @@ runs:
         set +e +o pipefail
         warn() { echo "::warning title=Retention tag skipped::$1 — promote still succeeded"; exit 0; }
 
-        RESPONSE=$(curl -fsSL -X POST "${FLUXNOW_API_BASE_URL}/api/ci/registry-auth/exchange" \
+        RESPONSE=$(curl -fsSL --connect-timeout 5 --max-time 20 -X POST "${FLUXNOW_API_BASE_URL}/api/ci/registry-auth/exchange" \
           -H "Authorization: Bearer ${FLUXNOW_TOKEN}" -H "Content-Type: application/json" \
           --data "{\"owner\":\"${REPO_OWNER}\",\"repo\":\"${REPO_NAME}\"}") || warn "credential exchange failed"
         REGISTRY_HOST=$(echo "${RESPONSE}" | jq -r '.registry_host')
@@ -246,12 +246,12 @@ runs:
         fi
         IMAGE_URI="${REGISTRY_HOST}/${REGISTRY_PROJECT}/${IMAGE_REPOSITORY}"
 
-        echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USERNAME}" --password-stdin \
+        echo "${REGISTRY_PASSWORD}" | timeout 30 docker login "${REGISTRY_HOST}" -u "${REGISTRY_USERNAME}" --password-stdin \
           || warn "registry login failed"
 
         # Server-side retag (no pull): point ${TARGET_ENV} at the SAME digest as the
         # promoted sha. Idempotent — re-running just re-points the tag.
-        docker buildx imagetools create --tag "${IMAGE_URI}:${TARGET_ENV}" "${IMAGE_URI}:${STAGING_TAG}" \
+        timeout 60 docker buildx imagetools create --tag "${IMAGE_URI}:${TARGET_ENV}" "${IMAGE_URI}:${STAGING_TAG}" \
           || warn "imagetools retag failed"
 
         echo "🏷️  Tagged ${IMAGE_URI}:${TARGET_ENV} → digest of ${STAGING_TAG} (protected from retention)"
